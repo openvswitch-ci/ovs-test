@@ -79,6 +79,9 @@ EXTRA_DIST = \
 	$(MAN_FRAGMENTS) \
 	$(MAN_ROOTS) \
 	.mailmap
+
+EXTRA_DIST += .github/workflows/leadtest-checkpatch.yml
+
 bin_PROGRAMS =
 sbin_PROGRAMS =
 bin_SCRIPTS =
