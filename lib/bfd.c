@@ -676,24 +676,27 @@ bfd_should_process_flow(const struct bfd *bfd_, const struct flow *flow,
     if (flow->dl_type == htons(ETH_TYPE_IP)) {
         memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
         if (flow->nw_proto == IPPROTO_UDP
-            && !(flow->nw_frag & FLOW_NW_FRAG_LATER)
-            && tp_dst_equals(flow, BFD_DEST_PORT, wc)
-            && (bfd->ip_src == htonl(BFD_DEFAULT_SRC_IP)
-                || bfd->ip_src == flow->nw_dst)) {
-
-            if (bfd->ip_src == flow->nw_dst) {
-                memset(&wc->masks.nw_dst, 0xffffffff, sizeof wc->masks.nw_dst);
-            }
-
+            && !(flow->nw_frag & FLOW_NW_FRAG_LATER)) {
             bool check_tnl_key;
 
             atomic_read_relaxed(&bfd->check_tnl_key, &check_tnl_key);
             if (check_tnl_key) {
                 memset(&wc->masks.tunnel.tun_id, 0xff,
                        sizeof wc->masks.tunnel.tun_id);
-                return flow->tunnel.tun_id == htonll(0);
+                if (flow->tunnel.tun_id != htonll(0)) {
+                    return false;
+                }
             }
-            return true;
+
+            if (tp_dst_equals(flow, BFD_DEST_PORT, wc)
+                && (bfd->ip_src == htonl(BFD_DEFAULT_SRC_IP)
+                    || bfd->ip_src == flow->nw_dst)) {
+                if (bfd->ip_src == flow->nw_dst) {
+                    memset(&wc->masks.nw_dst, 0xff, sizeof wc->masks.nw_dst);
+                }
+
+                return true;
+            }
         }
     }
     return false;
