@@ -8493,8 +8493,22 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
                                              &xin->upcall_flow->tunnel,
                                              &flow->tunnel);
         if (err) {
+            const struct flow_tnl *upcall_tnl = &xin->upcall_flow->tunnel;
+
             xlate_report_error(&ctx, "Invalid Geneve tunnel metadata");
             ctx.error = XLATE_INVALID_TUNNEL_METADATA;
+
+            /* The resulting drop flow must match on the exact options that
+             * failed to parse.  Otherwise, it will have the options fully
+             * wildcarded and will also drop all packets with valid options
+             * of the same total length, because the conversion of the masks
+             * into udpif format at the end of this function is skipped. */
+            memset(&ctx.wc->masks.tunnel.metadata, 0,
+                   sizeof ctx.wc->masks.tunnel.metadata);
+            memset(ctx.wc->masks.tunnel.metadata.opts.u8, 0xff,
+                   upcall_tnl->metadata.present.len);
+            ctx.wc->masks.tunnel.metadata.present.len = 0xff;
+            ctx.wc->masks.tunnel.flags |= FLOW_TNL_F_UDPIF;
             goto exit;
         }
     } else if (!flow->tunnel.metadata.tab) {
