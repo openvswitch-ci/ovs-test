@@ -83,7 +83,6 @@
 #include "smap.h"
 #include "sset.h"
 #include "timeval.h"
-#include "tnl-neigh-cache.h"
 #include "tnl-ports.h"
 #include "unixctl.h"
 #include "util.h"
@@ -5981,7 +5980,6 @@ dpif_netdev_run(struct dpif *dpif)
     }
     ovs_rwlock_unlock(&dp->port_rwlock);
 
-    tnl_neigh_cache_run();
     tnl_port_map_run();
     new_tnl_seq = seq_read(tnl_conf_seq);
 

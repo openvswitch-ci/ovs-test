@@ -52,8 +52,11 @@ the first matching rule will be selected for deletion.
 .
 .IP "\fBtnl/neigh/show\fR"
 .IP "\fBtnl/arp/show\fR"
-OVS builds ARP cache by snooping are messages. This command shows
-ARP cache table.
+Shows the tunnel neighbor cache learned from ARP and IPv6 Neighbor Discovery
+or configured with \fBtnl/neigh/set\fR.  An entry marked \fBREFRESHING\fR
+can still forward packets using its cached MAC while OVS tries to renew it.
+If the neighbor is not learned again, the entry expires at its original
+deadline.
 .
 .IP "\fBtnl/neigh/set\fR \fIbridge\fR \fIip\fR \fImac\fR"
 .IP "\fBtnl/arp/set\fR \fIbridge\fR \fIip\fR \fImac\fR"

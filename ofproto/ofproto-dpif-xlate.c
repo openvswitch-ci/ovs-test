@@ -3758,18 +3758,14 @@ tnl_route_lookup_flow(const struct xlate_ctx *ctx,
     return -ENOENT;
 }
 
-static int
-compose_table_xlate(struct xlate_ctx *ctx, const struct xport *out_dev,
-                    struct dp_packet *packet)
+static void
+xlate_send_packet_pipeline(const struct xport *out_dev,
+                           struct dp_packet *packet, int depth, int resubmits)
 {
     struct xbridge *xbridge = out_dev->xbridge;
     ovs_version_t version = ofproto_dpif_get_tables_version(xbridge->ofproto);
     struct ofpact_output output;
     struct flow flow;
-
-    if (!xlate_resubmit_resource_check(ctx)) {
-        return 0;
-    }
 
     ofpact_init(&output.ofpact, OFPACT_OUTPUT, sizeof output);
     flow_extract(packet, &flow);
@@ -3777,38 +3773,86 @@ compose_table_xlate(struct xlate_ctx *ctx, const struct xport *out_dev,
     output.port = OFPP_TABLE;
     output.max_len = 0;
 
-    return ofproto_dpif_execute_actions__(xbridge->ofproto, version, &flow,
-                                          NULL, &output.ofpact, sizeof output,
-                                          ctx->depth + 1, ctx->resubmits,
-                                          packet);
+    ofproto_dpif_execute_actions__(xbridge->ofproto, version, &flow, NULL,
+                                   &output.ofpact, sizeof output,
+                                   depth, resubmits, packet);
 }
 
 static void
-tnl_send_nd_request(struct xlate_ctx *ctx, const struct xport *out_dev,
-                     const struct eth_addr eth_src,
-                     struct in6_addr * ipv6_src, struct in6_addr * ipv6_dst)
+tnl_send_neigh_request(const struct xport *out_dev, struct eth_addr smac,
+                       const struct in6_addr *src, const struct in6_addr *dst,
+                       int depth, int resubmits)
 {
     struct dp_packet packet;
 
     dp_packet_init(&packet, 0);
-    compose_nd_ns(&packet, true, eth_src, eth_addr_zero, ipv6_src, ipv6_dst);
-    compose_table_xlate(ctx, out_dev, &packet);
+    if (IN6_IS_ADDR_V4MAPPED(dst)) {
+        compose_arp(&packet, ARP_OP_REQUEST, smac, eth_addr_zero, true,
+                    in6_addr_get_mapped_ipv4(src),
+                    in6_addr_get_mapped_ipv4(dst));
+    } else {
+        compose_nd_ns(&packet, true, smac, eth_addr_zero, src, dst);
+    }
+    xlate_send_packet_pipeline(out_dev, &packet, depth, resubmits);
     dp_packet_uninit(&packet);
 }
 
-static void
-tnl_send_arp_request(struct xlate_ctx *ctx, const struct xport *out_dev,
-                     const struct eth_addr eth_src,
-                     ovs_be32 ip_src, ovs_be32 ip_dst)
+/* Sends all tunnel neighbor refresh requests queued by the cache. */
+void
+xlate_tnl_neigh_refresh(void)
 {
-    struct dp_packet packet;
+    struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
+    char br_name[IFNAMSIZ], out_dev_name[IFNAMSIZ];
+    struct in6_addr dst;
 
-    dp_packet_init(&packet, 0);
-    compose_arp(&packet, ARP_OP_REQUEST,
-                eth_src, eth_addr_zero, true, ip_src, ip_dst);
+    if (!xcfg) {
+        return;
+    }
 
-    compose_table_xlate(ctx, out_dev, &packet);
-    dp_packet_uninit(&packet);
+    while (tnl_neigh_get_refresh(br_name, out_dev_name, &dst)) {
+        struct xbridge *xbridge = NULL;
+        struct xport *out_dev = NULL;
+        char dst_s[INET6_ADDRSTRLEN];
+        struct xbridge *iter;
+        struct eth_addr smac;
+        struct in6_addr src;
+        struct xport *port;
+
+        HMAP_FOR_EACH (iter, hmap_node, &xcfg->xbridges) {
+            if (!strcmp(iter->name, br_name)) {
+                xbridge = iter;
+                break;
+            }
+        }
+
+        if (!xbridge) {
+            continue;
+        }
+
+        ipv6_string_mapped(dst_s, &dst);
+        VLOG_DBG("refreshing tunnel neighbor %s on bridge %s",
+                 dst_s, xbridge->name);
+
+        /* A different port on the same bridge may use another VLAN.  Only
+         * manual entries without a learned interface can use any port. */
+        HMAP_FOR_EACH (port, ofp_node, &xbridge->xports) {
+            const char *name = netdev_get_name(port->netdev);
+
+            if ((!out_dev_name[0] || !strncmp(name, out_dev_name, IFNAMSIZ))
+                && !ovs_router_get_netdev_source_address(&dst, name, &src)) {
+                out_dev = port;
+                break;
+            }
+        }
+
+        if (!out_dev || netdev_get_etheraddr(out_dev->netdev, &smac)) {
+            VLOG_DBG("no output port for tunnel neighbor %s", dst_s);
+            continue;
+        }
+
+        COVERAGE_INC(xlate_actions_neigh_sent);
+        tnl_send_neigh_request(out_dev, smac, &src, &dst, 0, 0);
+    }
 }
 
 static void
@@ -3990,24 +4034,11 @@ native_tunnel_output(struct xlate_ctx *ctx, const struct xport *xport,
             nh_s_ip6 = s_ip6;
         }
 
-        if (d_ip) {
-            ovs_be32 nh_s_ip;
-
-            nh_s_ip = in6_addr_get_mapped_ipv4(&nh_s_ip6);
-            tnl_send_arp_request(ctx, out_dev, smac, nh_s_ip, d_ip);
-        } else {
-            tnl_send_nd_request(ctx, out_dev, smac, &nh_s_ip6, &d_ip6);
+        if (xlate_resubmit_resource_check(ctx)) {
+            tnl_send_neigh_request(out_dev, smac, &nh_s_ip6, &d_ip6,
+                                   ctx->depth + 1, ctx->resubmits);
         }
         return err;
-    }
-
-    if (ctx->xin->xcache) {
-        struct xc_entry *entry;
-
-        entry = xlate_cache_add_entry(ctx->xin->xcache, XC_TNL_NEIGH);
-        ovs_strlcpy(entry->tnl_neigh_cache.br_name, out_dev->xbridge->name,
-                    sizeof entry->tnl_neigh_cache.br_name);
-        entry->tnl_neigh_cache.d_ipv6 = d_ip6;
     }
 
     xlate_report(ctx, OFT_DETAIL, "tunneling from "ETH_ADDR_FMT" %s"
@@ -4475,8 +4506,13 @@ terminate_native_tunnel(struct xlate_ctx *ctx, const struct xport *xport,
          * do tunnel neighbor snooping. */
         if (*tnl_port == ODPP_NONE &&
             (check_neighbor_reply(ctx, flow) || is_garp(flow, wc))) {
-            tnl_neigh_snoop(flow, wc, ctx->xbridge->name,
-                            ctx->xin->allow_side_effects);
+            if (!tnl_neigh_snoop(flow, wc, ctx->xbridge->name,
+                                 netdev_get_name(xport->netdev),
+                                 ctx->xin->allow_side_effects)) {
+                /* Each reply must renew the entry, including replies that
+                 * match an already installed datapath flow. */
+                ctx->xout->slow |= SLOW_ACTION;
+            }
         } else if (*tnl_port != ODPP_NONE &&
                    ctx->xin->allow_side_effects &&
                    dl_type_is_ip_any(flow->dl_type)) {
@@ -4489,7 +4525,8 @@ terminate_native_tunnel(struct xlate_ctx *ctx, const struct xport *xport,
                 s_ip6 = flow->ipv6_src;
             }
 
-            tnl_neigh_set(ctx->xbridge->name, &s_ip6, mac);
+            tnl_neigh_set(ctx->xbridge->name, netdev_get_name(xport->netdev),
+                          &s_ip6, mac);
         }
     }
 
