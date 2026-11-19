@@ -3758,18 +3758,14 @@ tnl_route_lookup_flow(const struct xlate_ctx *ctx,
     return -ENOENT;
 }
 
-static int
-compose_table_xlate(struct xlate_ctx *ctx, const struct xport *out_dev,
-                    struct dp_packet *packet)
+static void
+xlate_send_packet_pipeline(const struct xport *out_dev,
+                           struct dp_packet *packet, int depth, int resubmits)
 {
     struct xbridge *xbridge = out_dev->xbridge;
     ovs_version_t version = ofproto_dpif_get_tables_version(xbridge->ofproto);
     struct ofpact_output output;
     struct flow flow;
-
-    if (!xlate_resubmit_resource_check(ctx)) {
-        return 0;
-    }
 
     ofpact_init(&output.ofpact, OFPACT_OUTPUT, sizeof output);
     flow_extract(packet, &flow);
@@ -3777,38 +3773,143 @@ compose_table_xlate(struct xlate_ctx *ctx, const struct xport *out_dev,
     output.port = OFPP_TABLE;
     output.max_len = 0;
 
-    return ofproto_dpif_execute_actions__(xbridge->ofproto, version, &flow,
-                                          NULL, &output.ofpact, sizeof output,
-                                          ctx->depth + 1, ctx->resubmits,
-                                          packet);
+    ofproto_dpif_execute_actions__(xbridge->ofproto, version, &flow, NULL,
+                                   &output.ofpact, sizeof output,
+                                   depth, resubmits, packet);
 }
 
 static void
-tnl_send_nd_request(struct xlate_ctx *ctx, const struct xport *out_dev,
-                     const struct eth_addr eth_src,
-                     struct in6_addr * ipv6_src, struct in6_addr * ipv6_dst)
+tnl_send_neigh_request(const struct xport *out_dev, struct eth_addr smac,
+                       const struct in6_addr *src, const struct in6_addr *dst,
+                       int depth, int resubmits)
 {
     struct dp_packet packet;
 
     dp_packet_init(&packet, 0);
-    compose_nd_ns(&packet, true, eth_src, eth_addr_zero, ipv6_src, ipv6_dst);
-    compose_table_xlate(ctx, out_dev, &packet);
+    if (IN6_IS_ADDR_V4MAPPED(dst)) {
+        compose_arp(&packet, ARP_OP_REQUEST, smac, eth_addr_zero, true,
+                    in6_addr_get_mapped_ipv4(src),
+                    in6_addr_get_mapped_ipv4(dst));
+    } else {
+        compose_nd_ns(&packet, true, smac, eth_addr_zero, src, dst);
+    }
+    xlate_send_packet_pipeline(out_dev, &packet, depth, resubmits);
     dp_packet_uninit(&packet);
 }
 
-static void
-tnl_send_arp_request(struct xlate_ctx *ctx, const struct xport *out_dev,
-                     const struct eth_addr eth_src,
-                     ovs_be32 ip_src, ovs_be32 ip_dst)
+/* With a null address, test whether the port has any IP address. */
+static bool
+xport_has_ip(const struct xport *port, const struct in6_addr *ip)
 {
-    struct dp_packet packet;
+    struct in6_addr *addrs, *masks;
+    int n_addrs;
 
-    dp_packet_init(&packet, 0);
-    compose_arp(&packet, ARP_OP_REQUEST,
-                eth_src, eth_addr_zero, true, ip_src, ip_dst);
+    if (netdev_get_addr_list(port->netdev, &addrs, &masks, &n_addrs)) {
+        return false;
+    }
 
-    compose_table_xlate(ctx, out_dev, &packet);
-    dp_packet_uninit(&packet);
+    bool found = false;
+    for (int i = 0; i < n_addrs; i++) {
+        if (!ip || ipv6_addr_equals(ip, &addrs[i])) {
+            found = true;
+            break;
+        }
+    }
+    free(addrs);
+    free(masks);
+    return found;
+}
+
+static struct xport *
+tnl_neigh_refresh_port(struct xbridge *xbridge, const char *learned_dev,
+                       const struct in6_addr *dst,
+                       const struct in6_addr *local_ip, struct in6_addr *src)
+{
+    struct xport *candidate = NULL;
+    char route_dev[IFNAMSIZ];
+    struct in6_addr gw;
+    struct xport *port;
+    int n_matches = 0;
+
+    /* A manual entry has no tunnel source or packet mark.  Prefer a direct
+     * route in the default lookup, then an unambiguous port on this bridge. */
+    bool routed = !learned_dev[0]
+                  && ovs_router_lookup(0, dst, route_dev, NULL, &gw)
+                  && (!ipv6_addr_is_set(&gw)
+                      || ipv6_addr_equals(&gw, &in6addr_v4mapped_any)
+                      || ipv6_addr_equals(&gw, dst));
+
+    HMAP_FOR_EACH (port, ofp_node, &xbridge->xports) {
+        const char *name = netdev_get_name(port->netdev);
+
+        if (learned_dev[0] && strcmp(name, learned_dev)) {
+            continue;
+        }
+
+        if (ovs_router_get_netdev_source_address(dst, name, src)) {
+            /* An off-prefix gateway can reply to the route's local source.
+             * Reuse that address only while it belongs to the learned port. */
+            if (!learned_dev[0] || !ipv6_addr_is_set(local_ip)
+                || !xport_has_ip(port, local_ip)) {
+                continue;
+            }
+            *src = *local_ip;
+        }
+        if (learned_dev[0] || (routed && !strcmp(route_dev, name))) {
+            return port;
+        }
+        candidate = port;
+        n_matches++;
+    }
+
+    return n_matches == 1 ? candidate : NULL;
+}
+
+/* Sends all tunnel neighbor refresh requests queued by the cache. */
+void
+xlate_tnl_neigh_refresh(void)
+{
+    struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
+    char br_name[IFNAMSIZ], out_dev_name[IFNAMSIZ];
+    struct in6_addr dst, local_ip;
+
+    if (!xcfg) {
+        return;
+    }
+
+    while (tnl_neigh_get_refresh(br_name, out_dev_name, &dst, &local_ip)) {
+        struct xbridge *xbridge = NULL;
+        char dst_s[INET6_ADDRSTRLEN];
+        struct xport *out_dev;
+        struct xbridge *iter;
+        struct eth_addr smac;
+        struct in6_addr src;
+
+        HMAP_FOR_EACH (iter, hmap_node, &xcfg->xbridges) {
+            if (!strcmp(iter->name, br_name)) {
+                xbridge = iter;
+                break;
+            }
+        }
+
+        if (!xbridge) {
+            continue;
+        }
+
+        ipv6_string_mapped(dst_s, &dst);
+        VLOG_DBG("refreshing tunnel neighbor %s on bridge %s",
+                 dst_s, xbridge->name);
+
+        out_dev = tnl_neigh_refresh_port(xbridge, out_dev_name, &dst,
+                                         &local_ip, &src);
+        if (!out_dev || netdev_get_etheraddr(out_dev->netdev, &smac)) {
+            VLOG_DBG("no output port for tunnel neighbor %s", dst_s);
+            continue;
+        }
+
+        COVERAGE_INC(xlate_actions_neigh_sent);
+        tnl_send_neigh_request(out_dev, smac, &src, &dst, 0, 0);
+    }
 }
 
 static void
@@ -3990,24 +4091,11 @@ native_tunnel_output(struct xlate_ctx *ctx, const struct xport *xport,
             nh_s_ip6 = s_ip6;
         }
 
-        if (d_ip) {
-            ovs_be32 nh_s_ip;
-
-            nh_s_ip = in6_addr_get_mapped_ipv4(&nh_s_ip6);
-            tnl_send_arp_request(ctx, out_dev, smac, nh_s_ip, d_ip);
-        } else {
-            tnl_send_nd_request(ctx, out_dev, smac, &nh_s_ip6, &d_ip6);
+        if (xlate_resubmit_resource_check(ctx)) {
+            tnl_send_neigh_request(out_dev, smac, &nh_s_ip6, &d_ip6,
+                                   ctx->depth + 1, ctx->resubmits);
         }
         return err;
-    }
-
-    if (ctx->xin->xcache) {
-        struct xc_entry *entry;
-
-        entry = xlate_cache_add_entry(ctx->xin->xcache, XC_TNL_NEIGH);
-        ovs_strlcpy(entry->tnl_neigh_cache.br_name, out_dev->xbridge->name,
-                    sizeof entry->tnl_neigh_cache.br_name);
-        entry->tnl_neigh_cache.d_ipv6 = d_ip6;
     }
 
     xlate_report(ctx, OFT_DETAIL, "tunneling from "ETH_ADDR_FMT" %s"
@@ -4429,21 +4517,6 @@ is_neighbor_reply_correct(const struct xlate_ctx *ctx, const struct flow *flow)
     return ret;
 }
 
-static bool
-xport_has_ip(const struct xport *xport)
-{
-    struct in6_addr *ip_addr, *mask;
-    int n_in6 = 0;
-
-    if (netdev_get_addr_list(xport->netdev, &ip_addr, &mask, &n_in6)) {
-        n_in6 = 0;
-    } else {
-        free(ip_addr);
-        free(mask);
-    }
-    return n_in6 ? true : false;
-}
-
 static bool check_neighbor_reply(struct xlate_ctx *ctx, struct flow *flow)
 {
     if (flow->dl_type == htons(ETH_TYPE_ARP) ||
@@ -4468,28 +4541,36 @@ terminate_native_tunnel(struct xlate_ctx *ctx, const struct xport *xport,
      * Not performing a lookup in this case to avoid unwildcarding extra
      * flow fields (dl_dst). */
     if (ovs_native_tunneling_is_on(ctx->xbridge->ofproto)
-        && xport_has_ip(xport)) {
+        && xport_has_ip(xport, NULL)) {
         *tnl_port = tnl_port_map_lookup(flow, wc);
 
         /* If no tunnel port was found and it's about an ARP or ICMPv6 packet,
          * do tunnel neighbor snooping. */
         if (*tnl_port == ODPP_NONE &&
             (check_neighbor_reply(ctx, flow) || is_garp(flow, wc))) {
-            tnl_neigh_snoop(flow, wc, ctx->xbridge->name,
-                            ctx->xin->allow_side_effects);
+            if (!tnl_neigh_snoop(flow, wc, ctx->xbridge->name,
+                                 netdev_get_name(xport->netdev),
+                                 ctx->xin->allow_side_effects)) {
+                /* Each reply must renew the entry, including replies that
+                 * match an already installed datapath flow. */
+                ctx->xout->slow |= SLOW_ACTION;
+            }
         } else if (*tnl_port != ODPP_NONE &&
                    ctx->xin->allow_side_effects &&
                    dl_type_is_ip_any(flow->dl_type)) {
             struct eth_addr mac = flow->dl_src;
-            struct in6_addr s_ip6;
+            struct in6_addr s_ip6, d_ip6;
 
             if (flow->dl_type == htons(ETH_TYPE_IP)) {
                 in6_addr_set_mapped_ipv4(&s_ip6, flow->nw_src);
+                in6_addr_set_mapped_ipv4(&d_ip6, flow->nw_dst);
             } else {
                 s_ip6 = flow->ipv6_src;
+                d_ip6 = flow->ipv6_dst;
             }
 
-            tnl_neigh_set(ctx->xbridge->name, &s_ip6, mac);
+            tnl_neigh_set(ctx->xbridge->name, netdev_get_name(xport->netdev),
+                          &s_ip6, mac, &d_ip6);
         }
     }
 

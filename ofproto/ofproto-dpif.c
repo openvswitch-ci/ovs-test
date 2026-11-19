@@ -69,6 +69,7 @@
 #include "simap.h"
 #include "smap.h"
 #include "timer.h"
+#include "tnl-neigh-cache.h"
 #include "tunnel.h"
 #include "unaligned.h"
 #include "unixctl.h"
@@ -361,12 +362,17 @@ static int
 type_run(const char *type)
 {
     struct dpif_backer *backer;
+    int error = 0;
 
     backer = shash_find_data(&all_dpif_backers, type);
     if (!backer) {
         /* This is not necessarily a problem, since backers are only
          * created on demand. */
         return 0;
+    }
+
+    if (dpif_supports_tnl_push_pop(backer->dpif)) {
+        tnl_neigh_cache_run();
     }
 
     if (dpif_run(backer->dpif)) {
@@ -379,21 +385,19 @@ type_run(const char *type)
      * and the configuration has now changed to "false", enable receiving
      * packets from the datapath. */
     if (!backer->recv_set_enable && !ofproto_get_flow_restore_wait()) {
-        int error;
-
-        backer->recv_set_enable = true;
-
-        error = dpif_recv_set(backer->dpif, backer->recv_set_enable);
-        if (error) {
-            VLOG_ERR("Failed to enable receiving packets in dpif.");
-            return error;
+        error = dpif_recv_set(backer->dpif, true);
+        if (!error) {
+            backer->recv_set_enable = true;
+            dpif_flow_flush(backer->dpif);
+            backer->need_revalidate = REV_RECONFIGURE;
         }
-        dpif_flow_flush(backer->dpif);
-        backer->need_revalidate = REV_RECONFIGURE;
     }
 
     if (backer->recv_set_enable) {
         udpif_set_threads(backer->udpif, n_handlers, n_revalidators);
+        if (dpif_supports_tnl_push_pop(backer->dpif)) {
+            xlate_tnl_neigh_refresh();
+        }
     }
 
     if (recheck_support_explicit_drop_action(backer)) {
@@ -525,7 +529,7 @@ type_run(const char *type)
     ct_zone_timeout_policy_sweep(backer);
     ct_zone_limits_commit(backer);
 
-    return 0;
+    return error;
 }
 
 /* Check for and handle port changes in 'backer''s dpif. */
@@ -674,6 +678,9 @@ type_wait(const char *type)
         return;
     }
 
+    if (dpif_supports_tnl_push_pop(backer->dpif)) {
+        tnl_neigh_cache_wait();
+    }
     dpif_wait(backer->dpif);
 }
 
@@ -5172,7 +5179,6 @@ ofproto_dpif_xcache_execute(struct ofproto_dpif *ofproto,
         case XC_MIRROR:
         case XC_NORMAL:
         case XC_GROUP:
-        case XC_TNL_NEIGH:
         case XC_TUNNEL_HEADER:
             xlate_push_stats_entry(entry, stats, false);
             break;
