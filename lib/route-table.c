@@ -97,7 +97,6 @@ static void route_table_change(struct route_table_msg *, void *aux);
 static void rules_change(const struct route_table_msg *, void *aux);
 static void route_map_clear(void);
 
-static void name_table_init(void);
 static void name_table_change(const struct rtnetlink_change *, void *);
 
 static void
@@ -136,6 +135,7 @@ route_table_init(void)
     ovs_assert(!route6_notifier);
     ovs_assert(!rule_notifier);
     ovs_assert(!rule6_notifier);
+    ovs_assert(!name_notifier);
 
     ovs_router_init();
     nln = nln_create(NETLINK_ROUTE, route_nln_parse, &nln_rtmsg_change);
@@ -155,7 +155,8 @@ route_table_init(void)
                             (nln_notify_func *) rules_change, NULL);
 
     route_table_reset();
-    name_table_init();
+
+    name_notifier = rtnetlink_notifier_create(name_table_change, NULL);
 
     ovs_mutex_unlock(&route_table_mutex);
 }
@@ -799,14 +800,6 @@ route_table_fallback_lookup(const struct in6_addr *ip6_dst OVS_UNUSED,
 
 
 /* name_table . */
-
-static void
-name_table_init(void)
-{
-    name_notifier = rtnetlink_notifier_create(name_table_change, NULL);
-}
-
-
 static void
 name_table_change(const struct rtnetlink_change *change,
                   void *aux OVS_UNUSED)
