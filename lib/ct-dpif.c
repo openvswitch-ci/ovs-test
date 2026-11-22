@@ -290,8 +290,10 @@ static int
 ct_dpif_flush_tuple(struct dpif *dpif, const uint16_t *zone,
                     const struct ofp_ct_match *match)
 {
+    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 5);
     struct ct_dpif_dump_state *dump;
     struct ct_dpif_entry cte;
+    int flush_error = 0;
     int error;
     int tot_bkts;
 
@@ -328,10 +330,20 @@ ct_dpif_flush_tuple(struct dpif *dpif, const uint16_t *zone,
         }
 
         if (ct_dpif_entry_cmp(&cte, match)) {
-            error = dpif->dpif_class->ct_flush(dpif, &cte.zone,
-                                               &cte.tuple_orig);
-            if (error) {
-                break;
+            int err = dpif->dpif_class->ct_flush(dpif, &cte.zone,
+                                                 &cte.tuple_orig);
+
+            /* The dump is a snapshot.  An entry that expired or was removed
+             * after it was dumped is already gone, which is what the flush
+             * wants.  Any other failure must not stop the flush either: the
+             * remaining entries still have to be removed. */
+            if (err && err != ENOENT) {
+                VLOG_WARN_RL(&rl, "%s: failed to flush a conntrack entry "
+                             "in zone %"PRIu16" (%s)", dpif_name(dpif),
+                             cte.zone, ovs_strerror(err));
+                if (!flush_error) {
+                    flush_error = err;
+                }
             }
         }
     }
@@ -340,7 +352,7 @@ ct_dpif_flush_tuple(struct dpif *dpif, const uint16_t *zone,
     }
 
     ct_dpif_dump_done(dump);
-    return error;
+    return error ? error : flush_error;
 }
 
 /* Flush the entries in the connection tracker used by 'dpif'.  The
