@@ -296,3 +296,15 @@ AT_CLEANUP
 AT_SETUP([Conntrack Library - FTP ALG parsing])
 AT_CHECK([ovstest test-conntrack ftp-alg-large-payload])
 AT_CLEANUP
+
+AT_SETUP([ct-dpif - partial match flush])
+AT_KEYWORDS([conntrack])
+AT_CHECK([ovstest test-ct-dpif], [0], [dnl
+all deleted: ok
+gone in the middle: ok
+gone at the end: ok
+all gone: ok
+not supported: ok
+gone, then no buffers: ok
+])
+AT_CLEANUP
