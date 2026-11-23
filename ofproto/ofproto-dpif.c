@@ -5569,13 +5569,13 @@ type_set_config(const char *type, const struct smap *other_config)
     dpif_set_config(backer->dpif, other_config);
 }
 
-static void
+static int
 ct_flush(const struct ofproto *ofproto_, const uint16_t *zone,
          const struct ofp_ct_match *match)
 {
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofproto_);
 
-    ct_dpif_flush(ofproto->backer->dpif, zone, match);
+    return ct_dpif_flush(ofproto->backer->dpif, zone, match);
 }
 
 static struct ct_timeout_policy *

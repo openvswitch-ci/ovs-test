@@ -893,6 +893,20 @@ enum ofperr {
     /* NX1.0-1.1(1,535), NX1.2+(36).  Protocol is not configured on this
      * Open vSwitch instance. */
     OFPERR_NXST_NOT_CONFIGURED,
+
+/* ## ------------ ## */
+/* ## NXT_CT_FLUSH ## */
+/* ## ------------ ## */
+
+    /* NX1.0-1.1(1,538), NX1.2+(45).  This datapath cannot flush the
+     * connection tracking entries that an NXT_CT_FLUSH or NXT_CT_FLUSH_ZONE
+     * request asked for. */
+    OFPERR_NXCTF_NOT_SUPPORTED,
+
+    /* NX1.0-1.1(1,539), NX1.2+(46).  The datapath failed to flush the
+     * connection tracking entries that an NXT_CT_FLUSH or NXT_CT_FLUSH_ZONE
+     * request asked for.  Some of them may have been flushed. */
+    OFPERR_NXCTF_FAILED,
 };
 
 const char *ofperr_domain_get_name(enum ofp_version);

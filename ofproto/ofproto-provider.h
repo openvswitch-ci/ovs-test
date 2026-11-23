@@ -1924,9 +1924,13 @@ struct ofproto_class {
 /* ## ------------------- ## */
     /* Flushes the connection tracking tables. If 'zone' is not NULL,
      * only deletes connections in '*zone'. If 'match' is not NULL,
-     * deletes connections specified by the match. */
-    void (*ct_flush)(const struct ofproto *, const uint16_t *zone,
-                     const struct ofp_ct_match *match);
+     * deletes connections specified by the match.
+     *
+     * Returns 0 if successful, otherwise a positive errno value.  ENOENT
+     * means that the single connection that 'match' identifies does not
+     * exist. */
+    int (*ct_flush)(const struct ofproto *, const uint16_t *zone,
+                    const struct ofp_ct_match *match);
 
     /* Sets conntrack timeout policy specified by 'timeout_policy' to 'zone'
      * in datapath type 'dp_type'. */

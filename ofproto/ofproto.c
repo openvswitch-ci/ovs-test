@@ -943,6 +943,32 @@ handle_ipfix_flow_stats_request(struct ofconn *ofconn,
     return error;
 }
 
+/* Flushes the connection tracking entries that 'match' selects, in '*zone'
+ * if 'zone' is nonnull, and returns the OpenFlow error that reports the
+ * result to the controller that asked for the flush. */
+static enum ofperr
+ofproto_ct_flush(struct ofproto *ofproto, const uint16_t *zone,
+                 const struct ofp_ct_match *match)
+{
+    if (!ofproto->ofproto_class->ct_flush) {
+        return OFPERR_NXCTF_NOT_SUPPORTED;
+    }
+
+    switch (ofproto->ofproto_class->ct_flush(ofproto, zone, match)) {
+    case 0:
+    case ENOENT:
+        /* The connection that the controller wanted to be gone is not
+         * there, which is not a failure of the flush. */
+        return 0;
+
+    case EOPNOTSUPP:
+        return OFPERR_NXCTF_NOT_SUPPORTED;
+
+    default:
+        return OFPERR_NXCTF_FAILED;
+    }
+}
+
 static enum ofperr
 handle_nxt_ct_flush_zone(struct ofconn *ofconn, const struct ofp_header *oh)
 {
@@ -954,13 +980,8 @@ handle_nxt_ct_flush_zone(struct ofconn *ofconn, const struct ofp_header *oh)
     }
 
     uint16_t zone = ntohs(nzi->zone_id);
-    if (ofproto->ofproto_class->ct_flush) {
-        ofproto->ofproto_class->ct_flush(ofproto, &zone, NULL);
-    } else {
-        return EOPNOTSUPP;
-    }
 
-    return 0;
+    return ofproto_ct_flush(ofproto, &zone, NULL);
 }
 
 static enum ofperr
@@ -976,14 +997,7 @@ handle_nxt_ct_flush(struct ofconn *ofconn, const struct ofp_header *oh)
         return error;
     }
 
-    if (ofproto->ofproto_class->ct_flush) {
-        ofproto->ofproto_class->ct_flush(ofproto, with_zone ? &zone_id : NULL,
-                                         &match);
-    } else {
-        return EOPNOTSUPP;
-    }
-
-    return 0;
+    return ofproto_ct_flush(ofproto, with_zone ? &zone_id : NULL, &match);
 }
 
 void
