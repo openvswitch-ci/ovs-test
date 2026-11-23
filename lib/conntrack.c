@@ -429,34 +429,34 @@ zone_limit_update(struct conntrack *ct, int32_t zone, uint32_t limit)
 }
 
 static void
-conn_clean__(struct conntrack *ct, struct conn *conn)
+conn_clean_protected__(struct conntrack *ct, struct conntrack_zone *cz,
+                       struct conn *conn)
+    OVS_REQUIRES(cz->zone_lock)
 {
-    struct conntrack_zone *cz;
-    uint16_t fwd_zone;
     uint32_t hash;
+
+    COVERAGE_INC(conntrack_remove);
 
     if (conn->alg) {
         expectation_clean(ct, &conn->key_node[CT_DIR_FWD].key);
     }
 
-    fwd_zone = conn->key_node[CT_DIR_FWD].key.zone;
-    cz = &ct->zones[fwd_zone];
-
     hash = conn_key_hash(&conn->key_node[CT_DIR_FWD].key, ct->hash_basis);
-    ovs_mutex_lock(&cz->zone_lock);
     cmap_remove(&cz->conns,
                 &conn->key_node[CT_DIR_FWD].cm_node, hash);
     atomic_count_dec(&cz->count);
 
     if (conn->nat_action) {
-        ovs_assert(fwd_zone == conn->key_node[CT_DIR_REV].key.zone);
+        ovs_assert(conn->key_node[CT_DIR_FWD].key.zone ==
+                   conn->key_node[CT_DIR_REV].key.zone);
         hash = conn_key_hash(&conn->key_node[CT_DIR_REV].key,
                              ct->hash_basis);
         cmap_remove(&cz->conns,
                     &conn->key_node[CT_DIR_REV].cm_node, hash);
     }
 
-    ovs_mutex_unlock(&cz->zone_lock);
+    ovsrcu_postpone(delete_conn, conn);
+    atomic_count_dec(&ct->n_conn);
 }
 
 /* Also removes the associated nat 'conn' from the lookup
@@ -464,16 +464,33 @@ conn_clean__(struct conntrack *ct, struct conn *conn)
 static void
 conn_clean(struct conntrack *ct, struct conn *conn)
     OVS_EXCLUDED(conn->lock)
+    OVS_EXCLUDED(ct->zones[conn->key_node[CT_DIR_FWD].key.zone].zone_lock)
 {
     if (atomic_flag_test_and_set(&conn->reclaimed)) {
         return;
     }
 
-    COVERAGE_INC(conntrack_remove);
-    conn_clean__(ct, conn);
+    uint16_t zone = conn->key_node[CT_DIR_FWD].key.zone;
+    struct conntrack_zone *cz = &ct->zones[zone];
 
-    ovsrcu_postpone(delete_conn, conn);
-    atomic_count_dec(&ct->n_conn);
+    ovs_mutex_lock(&cz->zone_lock);
+    conn_clean_protected__(ct, cz, conn);
+    ovs_mutex_unlock(&cz->zone_lock);
+}
+
+/* Also removes the associated nat 'conn' from the lookup
+   datastructures. */
+static void
+conn_clean_protected(struct conntrack *ct, struct conntrack_zone *cz,
+                     struct conn *conn)
+    OVS_EXCLUDED(conn->lock)
+    OVS_REQUIRES(cz->zone_lock)
+{
+    if (atomic_flag_test_and_set(&conn->reclaimed)) {
+        return;
+    }
+
+    conn_clean_protected__(ct, cz, conn);
 }
 
 static void
@@ -1489,6 +1506,24 @@ conntrack_get_sweep_interval(struct conntrack *ct)
     return ms;
 }
 
+#define CONN_SWEEP_BUF_SIZE 100
+
+static void
+ct_sweep_buf(struct conntrack *ct, uint16_t zone,
+             struct conn *conn_buf[CONN_SWEEP_BUF_SIZE],
+             unsigned int n_conn_buf)
+{
+    if (n_conn_buf == 0) {
+        return;
+    }
+    struct conntrack_zone *cz = &ct->zones[zone];
+    ovs_mutex_lock(&cz->zone_lock);
+    for (unsigned i = 0; i < n_conn_buf; i++) {
+        conn_clean_protected(ct, cz, conn_buf[i]);
+    }
+    ovs_mutex_unlock(&cz->zone_lock);
+}
+
 static bool
 ct_sweep_zone(struct conntrack *ct, uint16_t zone, long long now,
               size_t *cleaned_count, size_t *conn_count, size_t limit,
@@ -1501,6 +1536,9 @@ ct_sweep_zone(struct conntrack *ct, uint16_t zone, long long now,
     struct cmap_cursor cursor;
     struct conn *conn;
     long long expiration;
+
+    struct conn *conn_buf[CONN_SWEEP_BUF_SIZE];
+    unsigned int n_conn_buf = 0;
 
     cz = &ct->zones[zone];
     if (atomic_count_get(&cz->count) == 0) {
@@ -1525,6 +1563,7 @@ ct_sweep_zone(struct conntrack *ct, uint16_t zone, long long now,
 
     CMAP_CURSOR_FOR_EACH_CONTINUE (keyn, cm_node, &cursor) {
         if (conn_handled > limit) {
+            ct_sweep_buf(ct, zone, conn_buf, n_conn_buf);
             *current_position = xzalloc(sizeof(**current_position));
             cmap_cursor_to_position(&cursor, *current_position);
             *conn_count = conn_handled;
@@ -1538,12 +1577,18 @@ ct_sweep_zone(struct conntrack *ct, uint16_t zone, long long now,
         conn = CONTAINER_OF(keyn, struct conn, key_node[keyn->dir]);
         expiration = conn_expiration(conn);
         if (now >= expiration) {
-            conn_clean(ct, conn);
+            conn_buf[n_conn_buf++] = conn;
             (*cleaned_count)++;
+        }
+
+        if (n_conn_buf == CONN_SWEEP_BUF_SIZE) {
+            ct_sweep_buf(ct, zone, conn_buf, n_conn_buf);
+            n_conn_buf = 0;
         }
 
         conn_handled++;
     }
+    ct_sweep_buf(ct, zone, conn_buf, n_conn_buf);
 
     *conn_count = conn_handled;
     return true;
