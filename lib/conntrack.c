@@ -520,6 +520,10 @@ conntrack_destroy(struct conntrack *ct)
     ovs_mutex_unlock(&ct->resources_lock);
     ovs_mutex_destroy(&ct->resources_lock);
 
+    if (ct->current_clean_position) {
+        free(ct->current_clean_position);
+    }
+
     ipf_destroy(ct->ipf);
     free(ct);
 }
@@ -1484,20 +1488,38 @@ conntrack_get_sweep_interval(struct conntrack *ct)
     return ms;
 }
 
-static size_t
+static bool
 ct_sweep_zone(struct conntrack *ct, uint16_t zone, long long now,
-              size_t *cleaned_count)
+              size_t *cleaned_count, size_t *conn_count, size_t limit,
+              struct cmap_position **current_position)
     OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     struct conn_key_node *keyn;
     struct conntrack_zone *cz;
-    unsigned int conn_count = 0;
-    unsigned int cleaned = 0;
+    unsigned int conn_handled = 0;
     struct conn *conn;
+    struct cmap_node *node;
     long long expiration;
 
     cz = &ct->zones[zone];
-    CMAP_FOR_EACH (keyn, cm_node, &cz->conns) {
+    if (atomic_count_get(&cz->count) == 0) {
+        *conn_count = 0;
+        free(*current_position);
+        *current_position = NULL;
+        return true;
+    }
+
+    if (!*current_position) {
+        *current_position = xzalloc(sizeof(**current_position));
+    }
+
+    while ((node = cmap_next_position(&cz->conns, *current_position))) {
+        keyn = OBJECT_CONTAINING(node, keyn, cm_node);
+        if (conn_handled > limit) {
+            *conn_count = conn_handled;
+            return false;
+        }
+
         if (keyn->dir != CT_DIR_FWD) {
             continue;
         }
@@ -1506,13 +1528,16 @@ ct_sweep_zone(struct conntrack *ct, uint16_t zone, long long now,
         expiration = conn_expiration(conn);
         if (now >= expiration) {
             conn_clean(ct, conn);
-            cleaned++;
+            (*cleaned_count)++;
         }
 
-        conn_count++;
+        conn_handled++;
     }
-    *cleaned_count = cleaned;
-    return conn_count;
+
+    free(*current_position);
+    *current_position = NULL;
+    *conn_count = conn_handled;
+    return true;
 }
 
 /* Cleans up old connection entries from 'ct'.  Returns the time
@@ -1525,28 +1550,35 @@ conntrack_clean(struct conntrack *ct, long long now)
     unsigned int n_conn_limit, i;
     size_t clean_end, count = 0;
     size_t total_cleaned = 0;
-    uint16_t current_zone = ct->next_clean_zone;
+    bool zone_finished;
 
     atomic_read_relaxed(&ct->n_conn_limit, &n_conn_limit);
     clean_end = n_conn_limit / 64;
 
     for (i = 0; i < ARRAY_SIZE(ct->zones); i++) {
+        size_t zone_count = 0;
         size_t cleaned = 0;
+        size_t clean_limit =
+            clean_end - count < clean_end ? clean_end - count : 0;
 
-        count += ct_sweep_zone(ct, current_zone, now, &cleaned);
+        zone_finished = ct_sweep_zone(ct, ct->current_clean_zone, now,
+                                      &cleaned, &zone_count,
+                                      clean_limit,
+                                      &ct->current_clean_position);
         total_cleaned += cleaned;
+        count += zone_count;
+
+        if (zone_finished) {
+            /* This will overflow and thereby allow us to iterate through all
+             * zones. */
+            ct->current_clean_zone++;
+        }
 
         if (count > clean_end) {
             next_wakeup = 0;
             break;
         }
-
-        /* This will overflow and thereby allow us to iterate through all
-         * zones. */
-        current_zone++;
     }
-
-    ct->next_clean_zone = current_zone + 1;
 
     VLOG_DBG("conntrack cleaned %"PRIuSIZE" entries out of %"PRIuSIZE
              " entries in %lld msec", total_cleaned, count,
