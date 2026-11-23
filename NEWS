@@ -15,6 +15,13 @@ v4.0.0 - 17 Aug 2026
        timer can be configured with 'tnl/neigh/retrans_time'.
      * Added support for software GSO for nested tunnels.
      * Removed experimental tag from the userspace TSO implementation.
+     * The conntrack cleanup thread will now continue cleaning if more than 10%
+       of all checked entries have been deleted in the past iteration. This
+       will ensure that old entries are removed faster in high churn
+       situations. The coverage counter conntrack_clean_fast_wakeup has been
+       added for such events.
+     * Improved multi-thread multi-zone scalability of the userspace
+       connection tracking.
    - DPDK:
      * Probing of devices at DPDK initialization has been disabled to avoid
        wasting resources on unused devices. This breaks DPDK netdev ports
