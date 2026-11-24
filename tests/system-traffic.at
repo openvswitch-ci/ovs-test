@@ -9629,6 +9629,53 @@ AT_CHECK([ovs-pcap client.pcap | grep 000000002010000000002000], [0], [dnl
 OVS_TRAFFIC_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([conntrack - ct flush with other IP protocols])
+CHECK_CONNTRACK()
+OVS_TRAFFIC_VSWITCHD_START()
+
+ADD_NAMESPACES(at_ns0, at_ns1)
+
+ADD_VETH(p0, at_ns0, br0, "10.1.1.1/24", "e6:66:c1:11:11:11")
+ADD_VETH(p1, at_ns1, br0, "10.1.1.2/24", "e6:66:c1:22:22:22")
+
+AT_DATA([flows.txt], [dnl
+priority=1,action=drop
+priority=10,arp,action=normal
+priority=100,in_port=1,ip,action=ct(zone=5,commit),2
+])
+
+AT_CHECK([ovs-ofctl --bundle add-flows br0 flows.txt])
+
+m4_define([IP_PKT], [m4_join([,],
+  [eth_src=e6:66:c1:11:11:11,eth_dst=e6:66:c1:22:22:22,eth_type=0x0800],
+  [nw_src=10.1.1.1,nw_dst=10.1.1.2,nw_ttl=64,nw_frag=no])])
+
+dnl One UDP connection, and one connection for each of a few protocols that
+dnl are not tracked by ports: GRE, and two that only have the addresses.
+NS_CHECK_EXEC([at_ns0], [$PYTHON3 $srcdir/sendpkt.py p0 \
+    $(ovs-ofctl compose-packet --bare 'IP_PKT,nw_proto=17,udp_src=1,udp_dst=2')],
+  [0], [ignore])
+m4_foreach([IP_PROTO], [[47], [41], [253]], [
+NS_CHECK_EXEC([at_ns0], [$PYTHON3 $srcdir/sendpkt.py p0 \
+    $(ovs-ofctl compose-packet --bare 'IP_PKT,nw_proto=IP_PROTO')],
+  [0], [ignore])
+])
+
+OVS_WAIT_UNTIL_EQUAL(
+  [ovs-appctl dpctl/dump-conntrack zone=5 | FORMAT_CT(10.1.1.2)], [dnl
+253,orig=(src=10.1.1.1,dst=10.1.1.2,sport=<cleared>,dport=<cleared>),reply=(src=10.1.1.2,dst=10.1.1.1,sport=<cleared>,dport=<cleared>),zone=5
+41,orig=(src=10.1.1.1,dst=10.1.1.2,sport=<cleared>,dport=<cleared>),reply=(src=10.1.1.2,dst=10.1.1.1,sport=<cleared>,dport=<cleared>),zone=5
+47,orig=(src=10.1.1.1,dst=10.1.1.2,sport=<cleared>,dport=<cleared>),reply=(src=10.1.1.2,dst=10.1.1.1,sport=<cleared>,dport=<cleared>),zone=5
+udp,orig=(src=10.1.1.1,dst=10.1.1.2,sport=<cleared>,dport=<cleared>),reply=(src=10.1.1.2,dst=10.1.1.1,sport=<cleared>,dport=<cleared>),zone=5])
+
+dnl A flush by a partial tuple has to delete the entries one by one.  It
+dnl must be able to delete all of them, whatever their protocol.
+AT_CHECK([ovs-ofctl ct-flush br0 zone=5 'ct_nw_src=10.1.1.1'])
+AT_CHECK([ovs-appctl dpctl/dump-conntrack zone=5 | FORMAT_CT(10.1.1.2)])
+
+OVS_TRAFFIC_VSWITCHD_STOP
+AT_CLEANUP
+
 AT_SETUP([conntrack - Flush many conntrack entries by port])
 CHECK_CONNTRACK()
 OVS_TRAFFIC_VSWITCHD_START()

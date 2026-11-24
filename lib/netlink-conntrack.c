@@ -665,15 +665,13 @@ nl_ct_put_tuple_proto(struct ofpbuf *buf, const struct ct_dpif_tuple *tuple)
         nl_msg_put_be16(buf, CTA_PROTO_ICMPV6_ID, tuple->icmp_id);
         nl_msg_put_u8(buf, CTA_PROTO_ICMPV6_TYPE, tuple->icmp_type);
         nl_msg_put_u8(buf, CTA_PROTO_ICMPV6_CODE, tuple->icmp_code);
-    } else if (tuple->ip_proto == IPPROTO_TCP ||
-               tuple->ip_proto == IPPROTO_UDP ||
-               tuple->ip_proto == IPPROTO_SCTP) {
+    } else {
+        /* TCP, UDP and SCTP have ports.  So do, as far as the kernel is
+         * concerned, the other protocols that it tracks by more than the
+         * addresses, e.g. the keys of GRE.  The kernel ignores the ports
+         * of a protocol that it tracks by addresses only. */
         nl_msg_put_be16(buf, CTA_PROTO_SRC_PORT, tuple->src_port);
         nl_msg_put_be16(buf, CTA_PROTO_DST_PORT, tuple->dst_port);
-    } else {
-        VLOG_WARN_RL(&rl, "Unsupported L4 protocol: %"PRIu8".",
-                     tuple->ip_proto);
-        return false;
     }
 
     nl_msg_end_nested(buf, offset);
