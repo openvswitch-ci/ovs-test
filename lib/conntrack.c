@@ -3026,7 +3026,9 @@ conntrack_flush_tuple(struct conntrack *ct, const struct ct_dpif_tuple *tuple,
     if (conn) {
         conn_clean(ct, conn);
     } else {
-        VLOG_WARN("Tuple not found");
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 5);
+
+        VLOG_INFO_RL(&rl, "Tuple not found");
         error = ENOENT;
     }
 
