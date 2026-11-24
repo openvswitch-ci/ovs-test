@@ -330,7 +330,11 @@ ct_dpif_flush_tuple(struct dpif *dpif, const uint16_t *zone,
         if (ct_dpif_entry_cmp(&cte, match)) {
             error = dpif->dpif_class->ct_flush(dpif, &cte.zone,
                                                &cte.tuple_orig);
-            if (error) {
+            /* The dump is a snapshot.  A connection that expired or was
+             * removed after it was dumped is already gone, which is what
+             * the flush wants, so ENOENT does not end the flush.  Any other
+             * error does. */
+            if (error && error != ENOENT) {
                 break;
             }
         }
