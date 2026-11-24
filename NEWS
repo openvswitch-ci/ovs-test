@@ -6,6 +6,10 @@ Post-v4.0.0
    - ovs-vswitchd:
      * Mirror filters now accept masked fields, e.g. "ip,nw_src=10.0.0.0/24"
        in the "filter" column of the Mirror table.
+   - OpenFlow:
+     * A failed NXT_CT_FLUSH or NXT_CT_FLUSH_ZONE request is now reported
+       to the controller, with the new errors NXCTF_NOT_SUPPORTED and
+       NXCTF_FAILED.  Before, the result of the flush was dropped.
 
 
 v4.0.0 - 17 Aug 2026
