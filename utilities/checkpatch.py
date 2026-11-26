@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import email
+import email.header
+import email.utils
 import getopt
 import os
 import re
@@ -895,6 +897,21 @@ def do_authors_exist(authors):
     return missing_authors
 
 
+def normalize_author(author):
+    # A mail header quotes a display name with special characters, such
+    # as a '.', and RFC 2047 encodes a non-ASCII one, while Signed-off-by
+    # tags carry the plain name.  Decode and unquote the name, so the
+    # author can be compared with the tags.
+    if not author or '<' not in author:
+        return author
+    decoded = str(email.header.make_header(
+        email.header.decode_header(author)))
+    name, address = email.utils.parseaddr(decoded)
+    if not name or not address:
+        return author
+    return '%s <%s>' % (name, address)
+
+
 def ovs_checkpatch_parse(text, filename, author=None, committer=None):
     global print_file_name, total_line, checking_file, \
         empty_return_check_state, missing_authors
@@ -1020,7 +1037,7 @@ def ovs_checkpatch_parse(text, filename, author=None, committer=None):
             elif is_committer.match(line):
                 committer = is_committer.match(line).group(2)
             elif is_author.match(line):
-                author = is_author.match(line).group(2)
+                author = normalize_author(is_author.match(line).group(2))
             elif is_subject.match(line):
                 run_subject_checks(line, spellcheck)
             elif is_signature.match(line):
@@ -1151,7 +1168,8 @@ def ovs_checkpatch_file(filename):
         if part.get_content_maintype() == 'multipart':
             continue
     result = ovs_checkpatch_parse(part.get_payload(decode=False), filename,
-                                  mail.get('Author', mail['From']),
+                                  normalize_author(
+                                      mail.get('Author', mail['From'])),
                                   mail['Commit'])
 
     if not mail['Subject'] or not mail['Subject'].strip():

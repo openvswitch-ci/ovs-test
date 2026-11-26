@@ -215,6 +215,22 @@ try_checkpatch \
     Signed-off-by: A" \
    "ERROR: Patch lacks author."
 
+# A mail header quotes a display name with special characters and RFC 2047
+# encodes a non-ASCII one, while the sign-off carries the plain name.
+try_checkpatch \
+   "From: \"A. B\" <ab@example.com>
+
+    Signed-off-by: A. B <ab@example.com>"
+try_checkpatch \
+   "From: =?UTF-8?q?Jo=C3=A3o?= <j@example.com>
+
+    Signed-off-by: João <j@example.com>"
+try_checkpatch \
+   "From: \"A. B\" <ab@example.com>
+
+    Signed-off-by: C <c@example.com>" \
+   "ERROR: Author A. B <ab@example.com> needs to sign off."
+
 AT_CLEANUP
 
 
