@@ -7379,6 +7379,12 @@ meter_get_features(const struct ofproto *ofproto_,
     dpif_meter_get_features(ofproto->backer->dpif, features);
 }
 
+/* Protects the 'meter_ids' pools of all backers.  Datapath meter ids are
+ * allocated by the main thread in meter_set(), but freed by the RCU thread in
+ * free_meter_id(), which meter_del() postpones, and 'struct id_pool' is not
+ * thread-safe. */
+static struct ovs_mutex meter_ids_mutex = OVS_MUTEX_INITIALIZER;
+
 static enum ofperr
 meter_set(struct ofproto *ofproto_, ofproto_meter_id *meter_id,
           struct ofputil_meter_config *config)
@@ -7387,11 +7393,17 @@ meter_set(struct ofproto *ofproto_, ofproto_meter_id *meter_id,
 
     /* Provider ID unknown. Use backer to allocate a new DP meter */
     if (meter_id->uint32 == UINT32_MAX) {
+        bool allocated;
+
         if (!ofproto->backer->meter_ids) {
             return OFPERR_OFPMMFC_OUT_OF_METERS; /* Meters not supported. */
         }
 
-        if(!id_pool_alloc_id(ofproto->backer->meter_ids, &meter_id->uint32)) {
+        ovs_mutex_lock(&meter_ids_mutex);
+        allocated = id_pool_alloc_id(ofproto->backer->meter_ids,
+                                     &meter_id->uint32);
+        ovs_mutex_unlock(&meter_ids_mutex);
+        if (!allocated) {
             return OFPERR_OFPMMFC_OUT_OF_METERS; /* Can't allocate meter. */
         }
     }
@@ -7438,7 +7450,9 @@ free_meter_id(struct free_meter_id_args *args)
     struct ofproto_dpif *ofproto = args->ofproto;
 
     dpif_meter_del(ofproto->backer->dpif, args->meter_id, NULL, 0);
+    ovs_mutex_lock(&meter_ids_mutex);
     id_pool_free_id(ofproto->backer->meter_ids, args->meter_id.uint32);
+    ovs_mutex_unlock(&meter_ids_mutex);
     free(args);
 }
 
