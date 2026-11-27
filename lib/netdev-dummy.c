@@ -287,7 +287,7 @@ dummy_packet_stream_run(struct netdev_dummy *dev, struct dummy_packet_stream *s)
     if (!ovs_list_is_empty(&s->txq)) {
         struct pkt_list_node *txbuf_node;
         struct dp_packet *txbuf;
-        int retval;
+        ssize_t retval;
 
         ASSIGN_CONTAINER(txbuf_node, ovs_list_front(&s->txq), list_node);
         txbuf = txbuf_node->pkt;

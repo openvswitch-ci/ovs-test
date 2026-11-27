@@ -280,7 +280,7 @@ test_send_hello(const char *type, const void *out, size_t out_size,
 
     n_sent = 0;
     while (n_sent < out_size) {
-        int retval;
+        ssize_t retval;
 
         retval = stream_send(stream, (char *) out + n_sent, out_size - n_sent);
         if (retval > 0) {
@@ -293,7 +293,8 @@ test_send_hello(const char *type, const void *out, size_t out_size,
             vconn_run_wait(vconn);
             poll_block();
         } else {
-            ovs_fatal(0, "stream_send returned unexpected value %d", retval);
+            ovs_fatal(0, "stream_send returned unexpected value %"PRIdSIZE,
+                      retval);
         }
     }
 
