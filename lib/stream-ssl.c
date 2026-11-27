@@ -1103,11 +1103,39 @@ stream_ssl_is_configured(void)
     return private_key.file_name || certificate.file_name || ca_cert.file_name;
 }
 
+/* Returns true if 'file_name' is not the file name recorded in 'config' or if
+ * the file was modified since its mtime was recorded.  Stores the current
+ * mtime of the file in '*mtime'.  Doesn't modify 'config'. */
+static bool
+ssl_config_file_changed(const struct ssl_config_file *config,
+                        const char *file_name, struct timespec *mtime)
+{
+    int error = get_mtime(file_name, mtime);
+    if (error && error != ENOENT) {
+        VLOG_ERR_RL(&rl, "%s: stat failed (%s)",
+                    file_name, ovs_strerror(error));
+    }
+    return !config->file_name
+           || strcmp(config->file_name, file_name)
+           || mtime->tv_sec != config->mtime.tv_sec
+           || mtime->tv_nsec != config->mtime.tv_nsec;
+}
+
+static void
+ssl_config_file_record(struct ssl_config_file *config, const char *file_name,
+                       const struct timespec *mtime)
+{
+    config->mtime = *mtime;
+    if (file_name != config->file_name) {
+        free(config->file_name);
+        config->file_name = xstrdup(file_name);
+    }
+}
+
 static bool
 update_ssl_config(struct ssl_config_file *config, const char *file_name)
 {
     struct timespec mtime;
-    int error;
 
     if (ssl_init() || !file_name) {
         return false;
@@ -1115,24 +1143,11 @@ update_ssl_config(struct ssl_config_file *config, const char *file_name)
 
     /* If the file name hasn't changed and neither has the file contents, stop
      * here. */
-    error = get_mtime(file_name, &mtime);
-    if (error && error != ENOENT) {
-        VLOG_ERR_RL(&rl, "%s: stat failed (%s)",
-                    file_name, ovs_strerror(error));
-    }
-    if (config->file_name
-        && !strcmp(config->file_name, file_name)
-        && mtime.tv_sec == config->mtime.tv_sec
-        && mtime.tv_nsec == config->mtime.tv_nsec) {
+    if (!ssl_config_file_changed(config, file_name, &mtime)) {
         return false;
     }
 
-    /* Update 'config'. */
-    config->mtime = mtime;
-    if (file_name != config->file_name) {
-        free(config->file_name);
-        config->file_name = xstrdup(file_name);
-    }
+    ssl_config_file_record(config, file_name, &mtime);
     return true;
 }
 
@@ -1174,37 +1189,117 @@ stream_ssl_set_certificate_file(const char *file_name)
     }
 }
 
+/* Reads the first certificate from PEM file 'file_name'.  Returns NULL and
+ * logs an error on failure. */
+static X509 *
+read_certificate_file(const char *file_name)
+{
+    FILE *file = fopen(file_name, "r");
+    if (!file) {
+        VLOG_ERR("failed to open %s for reading: %s",
+                 file_name, ovs_strerror(errno));
+        return NULL;
+    }
+
+    X509 *cert = PEM_read_X509(file, NULL, NULL, NULL);
+    if (!cert) {
+        VLOG_ERR("PEM_read_X509 failed reading %s: %s",
+                 file_name, ERR_error_string(ERR_get_error(), NULL));
+    }
+    fclose(file);
+    return cert;
+}
+
+/* Reads a private key from PEM file 'file_name'.  Returns NULL and logs an
+ * error on failure. */
+static EVP_PKEY *
+read_private_key_file(const char *file_name)
+{
+    FILE *file = fopen(file_name, "r");
+    if (!file) {
+        VLOG_ERR("failed to open %s for reading: %s",
+                 file_name, ovs_strerror(errno));
+        return NULL;
+    }
+
+    EVP_PKEY *key = PEM_read_PrivateKey(file, NULL, NULL, NULL);
+    if (!key) {
+        VLOG_ERR("PEM_read_PrivateKey failed reading %s: %s",
+                 file_name, ERR_error_string(ERR_get_error(), NULL));
+    }
+    fclose(file);
+    return key;
+}
+
 /* Sets the private key and certificate files in one operation.  Use this
  * interface, instead of calling stream_ssl_set_private_key_file() and
  * stream_ssl_set_certificate_file() individually, in the main loop of a
  * long-running program whose key and certificate might change at runtime.
  *
- * This is important because of OpenSSL's behavior.  If an OpenSSL context
- * already has a certificate, and stream_ssl_set_private_key_file() is called
- * to install a new private key, OpenSSL will report an error because the new
- * private key does not match the old certificate.  The other order, of setting
- * a new certificate, then setting a new private key, does work.
- *
- * If this were the only problem, calling stream_ssl_set_certificate_file()
- * before stream_ssl_set_private_key_file() would fix it.  But, if the private
- * key is changed before the certificate (e.g. someone "scp"s or "mv"s the new
- * private key in place before the certificate), then OpenSSL would reject that
- * change, and then the change of certificate would succeed, but there would be
- * no associated private key (because it had only changed once and therefore
- * there was no point in re-reading it).
- *
- * This function avoids both problems by, whenever either the certificate or
- * the private key file changes, re-reading both of them, in the correct order.
- */
+ * Whenever either of the files changes, both of them are re-read, and they
+ * are only installed if the private key matches the certificate.  Otherwise,
+ * e.g., if the new private key was written but the new certificate is not
+ * there yet, the private key and certificate currently in use are kept, and
+ * the new ones are installed as soon as the files change again and match.
+ * The same happens if any of the files can't be read, e.g., while it's being
+ * replaced. */
 void
 stream_ssl_set_key_and_cert(const char *private_key_file,
                             const char *certificate_file)
 {
-    if (update_ssl_config(&private_key, private_key_file)
-        && update_ssl_config(&certificate, certificate_file)) {
-        stream_ssl_set_certificate_file__(certificate_file);
-        stream_ssl_set_private_key_file__(private_key_file);
+    struct timespec key_mtime, cert_mtime;
+
+    if (ssl_init() || !private_key_file || !certificate_file) {
+        return;
     }
+
+    /* Check both files, a change in any of them requires re-reading both. */
+    bool key_changed = ssl_config_file_changed(&private_key, private_key_file,
+                                               &key_mtime);
+    bool cert_changed = ssl_config_file_changed(&certificate,
+                                                certificate_file, &cert_mtime);
+    if (!key_changed && !cert_changed) {
+        return;
+    }
+    ssl_config_file_record(&private_key, private_key_file, &key_mtime);
+    ssl_config_file_record(&certificate, certificate_file, &cert_mtime);
+
+    X509 *cert = read_certificate_file(certificate_file);
+    EVP_PKEY *key = read_private_key_file(private_key_file);
+    if (!cert || !key) {
+        goto out;
+    }
+
+    if (!X509_check_private_key(cert, key)) {
+        VLOG_WARN("private key %s and certificate %s mismatch, %s",
+                  private_key_file, certificate_file,
+                  private_key.read && certificate.read
+                  ? "keeping the ones in use"
+                  : "not using them");
+        goto out;
+    }
+
+    /* Install the certificate first, then the private key, as OpenSSL drops
+     * the private key that doesn't match a new certificate. */
+    if (SSL_CTX_use_certificate(ctx, cert) != 1
+        || SSL_CTX_use_PrivateKey(ctx, key) != 1) {
+        VLOG_ERR("failed to install private key %s and certificate %s: %s",
+                 private_key_file, certificate_file,
+                 ERR_error_string(ERR_get_error(), NULL));
+        goto out;
+    }
+    if (private_key.read && certificate.read) {
+        VLOG_INFO("reloaded private key %s and certificate %s",
+                  private_key_file, certificate_file);
+    }
+    private_key.read = certificate.read = true;
+
+out:
+    /* Don't leave errors in the OpenSSL error queue, they would make the next
+     * I/O on an unrelated connection fail. */
+    ERR_clear_error();
+    X509_free(cert);
+    EVP_PKEY_free(key);
 }
 
 /* Sets SSL/TLS ciphers for TLSv1.2 based on string input.

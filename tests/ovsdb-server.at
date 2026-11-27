@@ -996,6 +996,82 @@ OVSDB_SERVER_SHUTDOWN(["
   /Protocol error/d
 "])
 AT_CLEANUP
+
+AT_SETUP([SSL/TLS db: reload of private key and certificate])
+AT_KEYWORDS([ovsdb server positive ssl tls])
+AT_SKIP_IF([test "$HAVE_OPENSSL" = no])
+
+dnl Each server certificate is signed by one of the two CAs of ovs-pki, so
+dnl that a client that only trusts one of them tells which certificate the
+dnl server is using.  All the clients use a certificate signed by the
+dnl switch CA, which is the CA the server verifies clients against.
+PKI="sh $abs_top_srcdir/utilities/ovs-pki.in --dir=$(pwd)/pki --log=$(pwd)/pki.log"
+AT_CHECK([$PKI init], [0], [ignore], [ignore])
+AT_CHECK([$PKI req+sign client switch], [0], [ignore], [ignore])
+AT_CHECK([$PKI req+sign srv1 switch], [0], [ignore], [ignore])
+dnl Same private key as srv1, signed by the other CA.
+AT_CHECK([cp srv1-req.pem srv1b-req.pem && cp srv1-privkey.pem srv1b-privkey.pem])
+AT_CHECK([$PKI -b sign srv1b controller], [0], [ignore], [ignore])
+AT_CHECK([$PKI req+sign srv2 switch], [0], [ignore], [ignore])
+AT_CHECK([$PKI req+sign srv3 controller], [0], [ignore], [ignore])
+
+AT_DATA([schema],
+  [[{"name": "mydb",
+     "tables": {"T": {"columns": {"name": {"type": "string"}}}}}
+]])
+AT_CHECK([ovsdb-tool create db schema], [0], [ignore], [ignore])
+
+cp srv1-privkey.pem key.pem
+cp srv1-cert.pem cert.pem
+on_exit 'kill `cat *.pid`'
+AT_CHECK([ovsdb-server --log-file --detach --no-chdir --pidfile \
+            --private-key=key.pem --certificate=cert.pem \
+            --ca-cert=pki/switchca/cacert.pem \
+            --remote=pssl:0:127.0.0.1 db], [0], [ignore], [ignore])
+PARSE_LISTENING_PORT([ovsdb-server.log], [SSL_PORT])
+
+dnl SSL_CONNECT_TRUSTING CA
+dnl
+dnl Connects to the server trusting only the given CA ("switch" or
+dnl "controller").
+m4_define([SSL_CONNECT_TRUSTING],
+  [ovsdb-client --private-key=client-privkey.pem \
+                --certificate=client-cert.pem \
+                --ca-cert=pki/$1ca/cacert.pem \
+                list-dbs ssl:127.0.0.1:$SSL_PORT])
+
+AT_CHECK([SSL_CONNECT_TRUSTING([switch])], [0], [_Server
+mydb
+], [ignore])
+AT_CHECK([SSL_CONNECT_TRUSTING([controller])], [1], [ignore], [ignore])
+
+dnl Renew the certificate only, keeping the same private key.
+cp srv1b-cert.pem cert.pem
+OVS_WAIT_UNTIL([SSL_CONNECT_TRUSTING([controller])])
+AT_CHECK([SSL_CONNECT_TRUSTING([switch])], [1], [ignore], [ignore])
+
+dnl New private key and certificate, the key is written first.  The server
+dnl must keep using the old pair until the matching certificate is there.
+cp srv2-privkey.pem key.pem
+AT_CHECK([SSL_CONNECT_TRUSTING([controller])], [0], [ignore], [ignore])
+OVS_WAIT_UNTIL([grep -q 'and certificate .* mismatch' ovsdb-server.log])
+cp srv2-cert.pem cert.pem
+OVS_WAIT_UNTIL([SSL_CONNECT_TRUSTING([switch])])
+AT_CHECK([SSL_CONNECT_TRUSTING([controller])], [1], [ignore], [ignore])
+
+dnl New private key and certificate, the certificate is written first.
+cp srv3-cert.pem cert.pem
+AT_CHECK([SSL_CONNECT_TRUSTING([switch])], [0], [ignore], [ignore])
+cp srv3-privkey.pem key.pem
+OVS_WAIT_UNTIL([SSL_CONNECT_TRUSTING([controller])])
+AT_CHECK([SSL_CONNECT_TRUSTING([switch])], [1], [ignore], [ignore])
+
+OVSDB_SERVER_SHUTDOWN(["
+  /stream_ssl|WARN/d
+  /Protocol error/d
+  /and certificate .* mismatch/d
+"])
+AT_CLEANUP
 
 OVS_START_SHELL_HELPERS
 # ovsdb_check_online_compaction MODEL
